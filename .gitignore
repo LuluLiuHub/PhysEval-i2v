@@ -1,0 +1,14 @@
+# Heavy Model & Data Folders
+checkpoints/
+wan_models/
+vbench_official_eval/
+logs/
+results.txt
+output/
+hf_cache/
+*.err
+*.out
+# Python System Files
+__pycache__/
+*.pyc
+*.egg-info/

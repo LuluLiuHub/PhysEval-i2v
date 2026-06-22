@@ -1,0 +1,45 @@
+independent_first_frame: false
+warp_denoising_step: false
+weight_decay: 0.01
+same_step_across_blocks: true
+discriminator_lr_multiplier: 1.0
+last_step_only: false
+i2v: false
+num_training_frames: 21
+gc_interval: 100
+context_noise: 0
+causal: true
+
+# Inference guidance parameters
+use_inference_guidance: false
+num_candidates: 20
+
+# Multi-objective scoring weights (can be overridden per frame position)
+scoring_weights:
+  # First frame weights (prioritize CLIP alignment)
+  first_frame:
+    clip: 0.6
+    consistency: 0.1
+    quality: 0.2
+    smoothness: 0.1
+  # Early frames weights (balance alignment and consistency)
+  early_frames:
+    clip: 0.4
+    consistency: 0.3
+    quality: 0.2
+    smoothness: 0.1
+  # Later frames weights (prioritize consistency and smoothness)
+  later_frames:
+    clip: 0.3
+    consistency: 0.4
+    quality: 0.15
+    smoothness: 0.15
+
+ckpt_step: 0
+prompt_name: MovieGenVideoBench
+prompt_path: prompts/MovieGenVideoBench.txt
+eval_first_n: 64
+num_samples: 1
+height: 480
+width: 832
+num_frames: 81

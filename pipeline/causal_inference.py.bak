@@ -1,0 +1,809 @@
+from typing import List, Optional
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+import numpy as np
+import clip
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from pipeline.vlm_scorer import MultiObjectiveScorer
+
+from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
+from .sampling import NoiseSampler
+
+
+class CausalInferencePipeline(torch.nn.Module):
+    def __init__(
+            self,
+            args,
+            device,
+            generator=None,
+            text_encoder=None,
+            vae=None
+    ):
+        super().__init__()
+        # Step 1: Initialize all models
+        self.generator = WanDiffusionWrapper(
+            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+        self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
+        self.vae = WanVAEWrapper() if vae is None else vae
+
+        # Initialize multi-objective scorer
+        self.scorer = MultiObjectiveScorer(device, vae=self.vae)
+
+        # Initialize noise sampler
+        self.noise_sampler = NoiseSampler(device=device)
+
+        # Step 2: Initialize all causal hyperparmeters
+        self.scheduler = self.generator.get_scheduler()
+        self.denoising_step_list = torch.tensor(
+            args.denoising_step_list, dtype=torch.long)
+        if args.warp_denoising_step:
+            timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
+            self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
+
+        self.num_transformer_blocks = 30
+        self.frame_seq_length = 1560
+
+        self.kv_cache1 = None
+        self.args = args
+        self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
+        self.independent_first_frame = args.independent_first_frame
+        self.local_attn_size = self.generator.model.local_attn_size
+
+        # Iterative sampling configuration
+        self.iterative_sampling = getattr(args, 'iterative_sampling', False)
+        self.num_candidates_per_iteration = getattr(args, 'num_candidates_per_iteration', 5)
+        self.num_iterations = getattr(args, 'num_iterations', 3)
+        self.refinement_noise_scale = getattr(args, 'refinement_noise_scale', 0.5)  # Scale for noise around best candidate
+        self.refinement_distance = getattr(args, 'refinement_distance', 1.0)  # L2 distance for refined candidates
+
+        print(f"KV inference with {self.num_frame_per_block} frames per block")
+        if self.iterative_sampling:
+            print(f"Iterative sampling enabled: {self.num_iterations} iterations, {self.num_candidates_per_iteration} candidates per iteration, distance={self.refinement_distance}")
+
+        if self.num_frame_per_block > 1:
+            self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+    def inference(
+        self,
+        noise: torch.Tensor,
+        text_prompts: List[str],
+        initial_latent: Optional[torch.Tensor] = None,
+        return_latents: bool = False,
+        profile: bool = False,
+        low_memory: bool = False,
+        use_inference_guidance: bool = False,
+        noise_candidates: Optional[List[torch.Tensor]] = None,
+        clip_model = None,
+        clip_preprocess = None,
+        scoring_config = None,
+        save_intermediates: bool = False,
+        output_folder: str = None,
+        idx: int = 0,
+        noise_generation_type: str = "mixed",
+    ) -> torch.Tensor:
+        """
+        Perform inference on the given noise and text prompts.
+        Inputs:
+            noise (torch.Tensor): The input noise tensor of shape
+                (batch_size, num_output_frames, num_channels, height, width).
+            text_prompts (List[str]): The list of text prompts.
+            initial_latent (torch.Tensor): The initial latent tensor of shape
+                (batch_size, num_input_frames, num_channels, height, width).
+                If num_input_frames is 1, perform image to video.
+                If num_input_frames is greater than 1, perform video extension.
+            return_latents (bool): Whether to return the latents.
+        Outputs:
+            video (torch.Tensor): The generated video tensor of shape
+                (batch_size, num_output_frames, num_channels, height, width).
+                It is normalized to be in the range [0, 1].
+        """
+        batch_size, num_frames, num_channels, height, width = noise.shape
+        if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
+            # If the first frame is independent and the first frame is provided, then the number of frames in the
+            # noise should still be a multiple of num_frame_per_block
+            assert num_frames % self.num_frame_per_block == 0
+            num_blocks = num_frames // self.num_frame_per_block
+        else:
+            # Using a [1, 4, 4, 4, 4, 4, ...] model to generate a video without image conditioning
+            assert (num_frames - 1) % self.num_frame_per_block == 0
+            num_blocks = (num_frames - 1) // self.num_frame_per_block
+        num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
+        num_output_frames = num_frames + num_input_frames  # add the initial latent frames
+        conditional_dict = self.text_encoder(
+            text_prompts=text_prompts
+        )
+
+        if low_memory:
+            gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
+            move_model_to_device_with_memory_preservation(self.text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+
+        output = torch.zeros(
+            [batch_size, num_output_frames, num_channels, height, width],
+            device=noise.device,
+            dtype=noise.dtype
+        )
+
+        # Set up profiling if requested
+        if profile:
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            diffusion_start = torch.cuda.Event(enable_timing=True)
+            diffusion_end = torch.cuda.Event(enable_timing=True)
+            vae_start = torch.cuda.Event(enable_timing=True)
+            vae_end = torch.cuda.Event(enable_timing=True)
+            block_times = []
+            block_start = torch.cuda.Event(enable_timing=True)
+            block_end = torch.cuda.Event(enable_timing=True)
+            init_start.record()
+
+        # Step 1: Initialize KV cache to all zeros
+        if self.kv_cache1 is None:
+            self._initialize_kv_cache(
+                batch_size=batch_size,
+                dtype=noise.dtype,
+                device=noise.device
+            )
+            self._initialize_crossattn_cache(
+                batch_size=batch_size,
+                dtype=noise.dtype,
+                device=noise.device
+            )
+        else:
+            # reset cross attn cache
+            for block_index in range(self.num_transformer_blocks):
+                self.crossattn_cache[block_index]["is_init"] = False
+            # reset kv cache
+            for block_index in range(len(self.kv_cache1)):
+                self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
+                    [0], dtype=torch.long, device=noise.device)
+                self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
+                    [0], dtype=torch.long, device=noise.device)
+
+        # Step 2: Cache context feature
+        current_start_frame = 0
+        if initial_latent is not None:
+            timestep = torch.ones([batch_size, 1], device=noise.device, dtype=torch.int64) * 0
+            if self.independent_first_frame:
+                # Assume num_input_frames is 1 + self.num_frame_per_block * num_input_blocks
+                assert (num_input_frames - 1) % self.num_frame_per_block == 0
+                num_input_blocks = (num_input_frames - 1) // self.num_frame_per_block
+                output[:, :1] = initial_latent[:, :1]
+                self.generator(
+                    noisy_image_or_video=initial_latent[:, :1],
+                    conditional_dict=conditional_dict,
+                    timestep=timestep * 0,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+                current_start_frame += 1
+            else:
+                # Assume num_input_frames is self.num_frame_per_block * num_input_blocks
+                assert num_input_frames % self.num_frame_per_block == 0
+                num_input_blocks = num_input_frames // self.num_frame_per_block
+
+            for _ in range(num_input_blocks):
+                current_ref_latents = \
+                    initial_latent[:, current_start_frame:current_start_frame + self.num_frame_per_block]
+                output[:, current_start_frame:current_start_frame + self.num_frame_per_block] = current_ref_latents
+                self.generator(
+                    noisy_image_or_video=current_ref_latents,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep * 0,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+                current_start_frame += self.num_frame_per_block
+
+        if profile:
+            init_end.record()
+            torch.cuda.synchronize()
+            diffusion_start.record()
+
+        # Step 3: Temporal denoising loop
+        all_num_frames = [self.num_frame_per_block] * num_blocks
+        if self.independent_first_frame and initial_latent is None:
+            all_num_frames = [1] + all_num_frames
+
+        # Outer loop: iterate through frame blocks that need to be generated
+        for block_idx, current_num_frames in enumerate(all_num_frames):
+            if profile:
+                block_start.record()
+
+            # Handle inference guidance with frame-by-frame optimization
+            print(f"[DEBUG] Block {block_idx}: use_inference_guidance={use_inference_guidance}, current_start_frame={current_start_frame}, num_input_frames={num_input_frames}")
+            if use_inference_guidance and current_start_frame >= num_input_frames:
+                print(f"[DEBUG] Starting VLM guidance for frame block {block_idx} at start_frame {current_start_frame}")
+
+                # Get previous frames for consistency evaluation
+                if current_start_frame > 0:
+                    previous_frames = output[:, max(0, current_start_frame-self.num_frame_per_block):current_start_frame]
+                else:
+                    previous_frames = None
+
+                # Get immediate previous frame block for temporal consistency
+                if current_start_frame >= self.num_frame_per_block:
+                    prev_block = output[:, current_start_frame-self.num_frame_per_block:current_start_frame]
+                else:
+                    prev_block = None
+
+                # Inner loop: evaluate each noise candidate for this frame block
+                candidate_results = []
+                for candidate_idx, candidate_noise in enumerate(noise_candidates):
+                    # print(f"  Processing candidate {candidate_idx + 1}/{len(noise_candidates)}")
+
+                    # Extract noise for current frame block from this candidate
+                    frame_start = current_start_frame - num_input_frames
+                    frame_end = current_start_frame + current_num_frames - num_input_frames
+                    noisy_input = candidate_noise[:, frame_start:frame_end]
+
+                    # print(f"    Extracting frames {frame_start}:{frame_end} from candidate {candidate_idx}")
+                    # print(f"    noisy_input shape: {noisy_input.shape}, mean: {noisy_input.mean():.4f}, std: {noisy_input.std():.4f}")
+
+                    # Generate frames with this candidate noise (denoising steps)
+                    # Don't update cache during candidate evaluation to prevent contamination
+                    generated_frames = self._denoise_frames(
+                        noisy_input, conditional_dict, current_num_frames,
+                        batch_size, noise.device, current_start_frame,
+                        update_cache=False
+                    )
+
+                    # if soft_greedy:
+                    # Score the generated frames using multi-objective approach
+                    total_score, score_breakdown = self.scorer.score(
+                        generated_frames, text_prompts[0],
+                        prev_block, block_idx, scoring_config
+                    )
+                    # else:
+                    #     # fuzzy greedy
+                    #     # look at previous 
+
+                    candidate_results.append((candidate_idx, generated_frames, total_score, score_breakdown))
+                    # print(f"    Candidate {candidate_idx}: Total={total_score:.3f} "
+                    #       f"[VLM={score_breakdown['vlm']:.3f}, "
+                    #       f"Consistency={score_breakdown['consistency']:.3f}, Smoothness={score_breakdown['smoothness']:.3f}]")
+                    # modify to discard the candidates instead of storing them all
+                # Select best candidate based on multi-objective scores
+                best_candidate = max(candidate_results, key=lambda x: x[2])
+                best_candidate_idx = best_candidate[0]
+                denoised_pred = best_candidate[1]
+                best_scores = best_candidate[3]
+
+                # Re-run the winning candidate with cache updates enabled
+                # This ensures the cache contains the winning candidate's representations for future frames
+                best_candidate_noise = noise_candidates[best_candidate_idx]
+                frame_start = current_start_frame - num_input_frames
+                frame_end = current_start_frame + current_num_frames - num_input_frames
+                best_noisy_input = best_candidate_noise[:, frame_start:frame_end]
+
+                # Final denoising with cache updates for the winning candidate
+                denoised_pred = self._denoise_frames(
+                    best_noisy_input, conditional_dict, current_num_frames,
+                    batch_size, noise.device, current_start_frame,
+                    update_cache=True  # Now update the cache with winning candidate
+                )
+
+                # print(f"Selected candidate {best_candidate_idx} with total score {best_candidate[2]:.4f}")
+                print(f"  Best scores: VLM={best_scores['vlm']:.3f}, Total={best_scores['total']:.3f}")
+
+            else:
+                # Standard generation without guidance
+                noisy_input = noise[
+                    :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+
+                # Generate frames with standard denoising
+                if save_intermediates:
+                    denoised_pred, intermediate_results = self._denoise_frames(
+                        noisy_input, conditional_dict, current_num_frames,
+                        batch_size, noise.device, current_start_frame,
+                        save_intermediates=True
+                    )
+                    # Update output with current block
+                    output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+                    # Save intermediate videos with full accumulated frames
+                    self._save_intermediate_videos(intermediate_results, output_folder, idx, output, current_start_frame + current_num_frames)
+                else:
+                    denoised_pred = self._denoise_frames(
+                        noisy_input, conditional_dict, current_num_frames,
+                        batch_size, noise.device, current_start_frame
+                    )
+
+            # Step 3.2: record the model's output (if not already done for save_intermediates)
+            if not save_intermediates:
+                output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+
+            # Step 3.3: rerun with timestep zero to update KV cache using clean context
+            context_timestep = torch.ones([batch_size, current_num_frames], device=noise.device, dtype=torch.int64) * self.args.context_noise
+            self.generator(
+                noisy_image_or_video=denoised_pred,
+                conditional_dict=conditional_dict,
+                timestep=context_timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+            )
+
+            if profile:
+                block_end.record()
+                torch.cuda.synchronize()
+                block_time = block_start.elapsed_time(block_end)
+                block_times.append(block_time)
+
+            # Step 3.4: update the start and end frame indices
+            current_start_frame += current_num_frames
+
+        if profile:
+            # End diffusion timing and synchronize CUDA
+            diffusion_end.record()
+            torch.cuda.synchronize()
+            diffusion_time = diffusion_start.elapsed_time(diffusion_end)
+            init_time = init_start.elapsed_time(init_end)
+            vae_start.record()
+
+        # Step 4: Decode the output
+        video = self.vae.decode_to_pixel(output, use_cache=False)
+        video = (video * 0.5 + 0.5).clamp(0, 1)
+
+        if profile:
+            # End VAE timing and synchronize CUDA
+            vae_end.record()
+            torch.cuda.synchronize()
+            vae_time = vae_start.elapsed_time(vae_end)
+            total_time = init_time + diffusion_time + vae_time
+
+            print("Profiling results:")
+            print(f"  - Initialization/caching time: {init_time:.2f} ms ({100 * init_time / total_time:.2f}%)")
+            print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({100 * diffusion_time / total_time:.2f}%)")
+            for i, block_time in enumerate(block_times):
+                print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion)")
+            print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
+            print(f"  - Total time: {total_time:.2f} ms")
+
+        if return_latents:
+            return video, output
+        else:
+            return video
+
+    def _initialize_kv_cache(self, batch_size, dtype, device):
+        """
+        Initialize a Per-GPU KV cache for the Wan model.
+        """
+        kv_cache1 = []
+        if self.local_attn_size != -1:
+            # Use the local attention size to compute the KV cache size
+            kv_cache_size = self.local_attn_size * self.frame_seq_length
+        else:
+            # Use the default KV cache size
+            kv_cache_size = 32760
+
+        for _ in range(self.num_transformer_blocks):
+            kv_cache1.append({
+                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+            })
+
+        self.kv_cache1 = kv_cache1  # always store the clean cache
+
+    def _initialize_crossattn_cache(self, batch_size, dtype, device):
+        """
+        Initialize a Per-GPU cross-attention cache for the Wan model.
+        """
+        crossattn_cache = []
+
+        for _ in range(self.num_transformer_blocks):
+            crossattn_cache.append({
+                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "is_init": False
+            })
+        self.crossattn_cache = crossattn_cache
+
+    def score_frame_with_clip(self, frame_latent, text_prompt, clip_model, clip_preprocess):
+        """Score a single frame latent using CLIP model"""
+        # Decode the latent to pixel space
+        with torch.no_grad():
+            frame_pixel = self.vae.decode_to_pixel(frame_latent.unsqueeze(1), use_cache=False)  # Add time dimension
+            frame_pixel = (frame_pixel * 0.5 + 0.5).clamp(0, 1)  # Normalize to [0,1]
+            frame_pixel = frame_pixel.squeeze(1)  # Remove time dimension [batch, C, H, W]
+
+            scores = []
+            for i in range(frame_pixel.shape[0]):
+                # Convert to PIL format for CLIP preprocessing
+                frame = frame_pixel[i]  # [C, H, W]
+                frame_pil = transforms.ToPILImage()(frame.cpu())
+                frame_processed = clip_preprocess(frame_pil).unsqueeze(0).to(frame_latent.device)
+
+                # Encode text and image
+                import clip
+                text_tokens = clip.tokenize([text_prompt]).to(frame_latent.device)
+
+                image_features = clip_model.encode_image(frame_processed)
+                text_features = clip_model.encode_text(text_tokens)
+
+                # Normalize and compute similarity
+                image_features = F.normalize(image_features, dim=-1)
+                text_features = F.normalize(text_features, dim=-1)
+
+                similarity = torch.cosine_similarity(image_features, text_features, dim=-1)
+                scores.append(similarity.item())
+
+        return scores
+
+
+
+    def generate_widespread_noise_candidates(self, batch_size, num_frames, num_channels, height, width, device, dtype, num_candidates=20, noise_generation_type="mixed"):
+        """
+        Generate widespread noise candidates covering maximum noise space.
+
+        Args:
+            noise_generation_type: str, one of:
+                - "mixed": Mix all noise types (default behavior)
+                - "scale_variations": Only scale variations (0.5x to 2.0x)
+                - "pure_random": Only standard Gaussian noise
+                - "edge_cases": Only edge cases (very small/large/clipped)
+                - "frequency_variations": Only frequency domain variations
+                - "spatial_correlations": Only spatially correlated noise
+                - "temporal_correlations": Only temporally correlated noise
+        """
+        noise_candidates = []
+
+        if noise_generation_type == "scale_variations":
+            # print(f"Generating {num_candidates} scale variation noise candidates")
+            for candidate_idx in range(num_candidates):
+                frame_noises = []
+                for frame_idx in range(num_frames):
+                    # Scale variations from 0.5x to 2.0x
+                    scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
+                    scale = scales[(candidate_idx + frame_idx) % len(scales)]
+                    frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype) * scale
+                    frame_noises.append(frame_noise)
+                candidate_sequence = torch.stack(frame_noises, dim=1)
+                noise_candidates.append(candidate_sequence)
+            return noise_candidates[:num_candidates]
+
+        elif noise_generation_type == "pure_random":
+            # print(f"Generating {num_candidates} pure random noise candidates")
+            for candidate_idx in range(num_candidates):
+                frame_noises = []
+                for frame_idx in range(num_frames):
+                    frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype)
+                    frame_noises.append(frame_noise)
+                candidate_sequence = torch.stack(frame_noises, dim=1)
+                noise_candidates.append(candidate_sequence)
+            return noise_candidates[:num_candidates]
+
+        elif noise_generation_type == "edge_cases":
+            # print(f"Generating {num_candidates} edge case noise candidates")
+            for candidate_idx in range(num_candidates):
+                frame_noises = []
+                for frame_idx in range(num_frames):
+                    edge_case = (candidate_idx + frame_idx) % 6
+                    frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype)
+                    if edge_case == 0:  # Extreme positive tail
+                        frame_noise = torch.clamp(frame_noise, min=2.0)
+                    elif edge_case == 1:  # Extreme negative tail
+                        frame_noise = torch.clamp(frame_noise, max=-2.0)
+                    elif edge_case == 2:  # Near-zero values
+                        frame_noise = torch.clamp(frame_noise, min=-0.5, max=0.5)
+                    elif edge_case == 3:  # Bimodal distribution
+                        mask = torch.abs(frame_noise) > 1.0
+                        frame_noise = torch.where(mask, frame_noise, torch.sign(frame_noise) * 1.5)
+                    elif edge_case == 4:  # Very small noise
+                        frame_noise = frame_noise * 0.1
+                    else:  # Very large noise
+                        frame_noise = frame_noise * 3.0
+                    frame_noises.append(frame_noise)
+                candidate_sequence = torch.stack(frame_noises, dim=1)
+                noise_candidates.append(candidate_sequence)
+            return noise_candidates[:num_candidates]
+
+        elif noise_generation_type == "frequency_variations":
+            # print(f"Generating {num_candidates} frequency variation noise candidates")
+            for candidate_idx in range(num_candidates):
+                frame_noises = []
+                for frame_idx in range(num_frames):
+                    frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=torch.float32)
+                    fft_noise = torch.fft.fft2(frame_noise)
+
+                    freq_type = (candidate_idx + frame_idx) % 4
+                    if freq_type == 0:  # Low-pass
+                        mask = torch.zeros_like(fft_noise.real)
+                        mask[:, :, :height//4, :width//4] = 1
+                    elif freq_type == 1:  # High-pass
+                        mask = torch.ones_like(fft_noise.real)
+                        mask[:, :, :height//4, :width//4] = 0
+                    elif freq_type == 2:  # Band-pass
+                        mask = torch.zeros_like(fft_noise.real)
+                        mask[:, :, height//8:height//4, width//8:width//4] = 1
+                    else:  # Mid-frequency band
+                        mask = torch.zeros_like(fft_noise.real)
+                        mask[:, :, height//6:height//3, width//6:width//3] = 1
+
+                    fft_noise = fft_noise * mask
+                    frame_noise = torch.fft.ifft2(fft_noise).real.to(dtype)
+                    frame_noises.append(frame_noise)
+                candidate_sequence = torch.stack(frame_noises, dim=1)
+                noise_candidates.append(candidate_sequence)
+            return noise_candidates[:num_candidates]
+
+        elif noise_generation_type == "spatial_correlations":
+            # print(f"Generating {num_candidates} spatial correlation noise candidates")
+            for candidate_idx in range(num_candidates):
+                frame_noises = []
+                for frame_idx in range(num_frames):
+                    correlation_sizes = [4, 8, 16, 32, 64]
+                    size = correlation_sizes[(candidate_idx + frame_idx) % len(correlation_sizes)]
+                    base_noise = torch.randn(batch_size, num_channels, size, size, device=device, dtype=dtype)
+                    upsampled = F.interpolate(base_noise, size=(height, width), mode='bilinear', align_corners=False)
+                    fine_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype) * 0.2
+                    frame_noise = upsampled + fine_noise
+                    frame_noises.append(frame_noise)
+                candidate_sequence = torch.stack(frame_noises, dim=1)
+                noise_candidates.append(candidate_sequence)
+            return noise_candidates[:num_candidates]
+
+        elif noise_generation_type == "temporal_correlations":
+            # print(f"Generating {num_candidates} temporal correlation noise candidates")
+            for candidate_idx in range(num_candidates):
+                # Generate temporally correlated noise across frames
+                base_noise = torch.randn(batch_size, num_frames, num_channels, height, width, device=device, dtype=dtype)
+
+                # Apply temporal smoothing with different correlation strengths
+                correlation_strength = 0.2 + 0.6 * (candidate_idx / max(1, num_candidates - 1))  # 0.2 to 0.8
+
+                frame_noises = []
+                frame_noises.append(base_noise[:, 0])  # First frame is original
+
+                for frame_idx in range(1, num_frames):
+                    # Mix current frame with previous frame
+                    correlated_frame = (correlation_strength * frame_noises[-1] +
+                                      (1 - correlation_strength) * base_noise[:, frame_idx])
+                    frame_noises.append(correlated_frame)
+
+                candidate_sequence = torch.stack(frame_noises, dim=1)
+                noise_candidates.append(candidate_sequence)
+            return noise_candidates[:num_candidates]
+
+        elif noise_generation_type == "mixed":
+            # Original mixed distribution
+            # print(f"Generating {num_candidates} mixed noise candidates")
+            for candidate_idx in range(num_candidates):
+                frame_noises = []
+
+                for frame_idx in range(num_frames):
+                    # Optimize distribution: more scale variations and edge cases (best performers)
+                    if candidate_idx < 6:  # 30% - Pure random noise
+                        noise_type = 0
+                    elif candidate_idx < 14:  # 40% - Scale variations (best performers)
+                        noise_type = 1
+                    elif candidate_idx < 18:  # 20% - Gaussian edge cases (good performers)
+                        noise_type = 2
+                    elif candidate_idx < 19:  # 5% - Frequency variations
+                        noise_type = 3
+                    else:  # 5% - Spatial correlations (reduced, poor performers)
+                        noise_type = 4
+
+                    if noise_type == 0:  # Pure random noise (30%)
+                        frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype)
+
+                    elif noise_type == 1:  # Scale variations (40%) - best performers
+                        scales = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+                        scale = scales[(candidate_idx + frame_idx) % len(scales)]
+                        frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype) * scale
+
+                    elif noise_type == 2:  # Gaussian edge cases (20%) - good performers
+                        edge_case = (candidate_idx + frame_idx) % 4
+                        frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype)
+                        if edge_case == 0:  # Extreme positive tail
+                            frame_noise = torch.clamp(frame_noise, min=2.0)
+                        elif edge_case == 1:  # Extreme negative tail
+                            frame_noise = torch.clamp(frame_noise, max=-2.0)
+                        elif edge_case == 2:  # Near-zero values
+                            frame_noise = torch.clamp(frame_noise, min=-0.5, max=0.5)
+                        else:  # Bimodal distribution
+                            mask = torch.abs(frame_noise) > 1.0
+                            frame_noise = torch.where(mask, frame_noise, torch.sign(frame_noise) * 1.5)
+
+                    elif noise_type == 3:  # Frequency domain variations (5%)
+                        frame_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=torch.float32)
+                        fft_noise = torch.fft.fft2(frame_noise)
+
+                        freq_type = (candidate_idx + frame_idx) % 3
+                        if freq_type == 0:  # Low-pass
+                            mask = torch.zeros_like(fft_noise.real)
+                            mask[:, :, :height//4, :width//4] = 1
+                        elif freq_type == 1:  # High-pass
+                            mask = torch.ones_like(fft_noise.real)
+                            mask[:, :, :height//4, :width//4] = 0
+                        else:  # Band-pass
+                            mask = torch.zeros_like(fft_noise.real)
+                            mask[:, :, height//8:height//4, width//8:width//4] = 1
+
+                        fft_noise = fft_noise * mask
+                        frame_noise = torch.fft.ifft2(fft_noise).real.to(dtype)
+
+                    else:  # Spatial correlation variations (5%)
+                        correlation_sizes = [4, 8, 16, 32]
+                        size = correlation_sizes[(candidate_idx + frame_idx) % len(correlation_sizes)]
+                        base_noise = torch.randn(batch_size, num_channels, size, size, device=device, dtype=dtype)
+                        upsampled = F.interpolate(base_noise, size=(height, width), mode='bilinear', align_corners=False)
+                        fine_noise = torch.randn(batch_size, num_channels, height, width, device=device, dtype=dtype) * 0.2
+                        frame_noise = upsampled + fine_noise
+
+                    frame_noises.append(frame_noise)
+
+                # Stack all frames for this candidate
+                candidate_sequence = torch.stack(frame_noises, dim=1)  # [batch, frames, channels, h, w]
+                noise_candidates.append(candidate_sequence)
+
+            return noise_candidates[:num_candidates]
+
+        else:
+            raise ValueError(f"Unknown noise_generation_type: {noise_generation_type}. "
+                           f"Must be one of: mixed, scale_variations, pure_random, edge_cases, "
+                           f"frequency_variations, spatial_correlations, temporal_correlations")
+
+
+
+    def collect_training_data(self, text_prompts, num_frames_per_prompt=10):
+        """
+        Collect training data for noise network by comprehensive search.
+        Returns: (prev_noise, text_embeds, best_noise, scores) tuples
+        """
+        training_data = []
+
+        for text_prompt in text_prompts:
+            print(f"Collecting data for: {text_prompt}")
+
+            # Get text embeddings
+            with torch.no_grad():
+                text_embeds = self.text_encoder([text_prompt])["prompt_embeds"]
+
+            # Start with random previous noise
+            prev_noise = torch.randn(1, 16, 60, 104, device=text_embeds.device)
+
+            for frame_idx in range(num_frames_per_prompt):
+                # Comprehensive noise search
+                best_noise, all_candidates, all_scores = self.comprehensive_noise_search(
+                    prev_noise, text_prompt, text_embeds, num_candidates=50
+                )
+
+                # Collect training data with combined score (includes aesthetic)
+                training_data.append({
+                    'prev_noise': prev_noise.clone(),
+                    'text_embeds': text_embeds.clone(),
+                    'target_noise': best_noise['noise'].clone(),
+                    'scores': best_noise['scores'],
+                    'text_prompt': text_prompt
+                })
+
+                # Update prev_noise for next frame
+                prev_noise = best_noise['noise']
+
+        return training_data
+
+    def _denoise_single_step(self, noisy_input, conditional_dict, current_num_frames, batch_size, device, current_start_frame, step_index=0):
+        """Perform only a single denoising step for candidate evaluation"""
+        current_timestep = self.denoising_step_list[step_index]
+
+        # Set current timestep
+        timestep = torch.ones(
+            [batch_size, current_num_frames],
+            device=device,
+            dtype=torch.int64) * current_timestep
+
+        # Run single denoising step
+        _, denoised_pred = self.generator(
+            noisy_image_or_video=noisy_input,
+            conditional_dict=conditional_dict,
+            timestep=timestep,
+            kv_cache=self.kv_cache1,
+            crossattn_cache=self.crossattn_cache,
+            current_start=current_start_frame * self.frame_seq_length
+        )
+
+        return denoised_pred
+
+    def _denoise_frames(self, noisy_input, conditional_dict, current_num_frames, batch_size, device, current_start_frame, save_intermediates=False, update_cache=True):
+        """Perform the denoising steps for a given noisy input"""
+        intermediate_results = [] if save_intermediates else None
+
+        for index, current_timestep in enumerate(self.denoising_step_list):
+            # set current timestep
+            timestep = torch.ones(
+                [batch_size, current_num_frames],
+                device=device,
+                dtype=torch.int64) * current_timestep
+
+            if index < len(self.denoising_step_list) - 1:
+                _, denoised_pred = self.generator(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                    update_cache=update_cache
+                )
+
+                # Save intermediate result if requested
+                if save_intermediates:
+                    intermediate_results.append({
+                        'timestep': current_timestep.item(),
+                        'denoised_pred': denoised_pred.clone().cpu(),
+                        'step_index': index
+                    })
+                next_timestep = self.denoising_step_list[index + 1]
+                # EXPERIMENT: Keep intermediate noise random (initial noise is still deterministic)
+                # torch.manual_seed(42 + index)  # COMMENTED: Different seed per step but deterministic
+                intermediate_noise = torch.randn_like(denoised_pred.flatten(0, 1))  # Random intermediate noise
+                noisy_input = self.scheduler.add_noise(
+                    denoised_pred.flatten(0, 1),
+                    intermediate_noise,
+                    next_timestep * torch.ones(
+                        [batch_size * current_num_frames], device=device, dtype=torch.long)
+                ).unflatten(0, denoised_pred.shape[:2])
+            else:
+                # for getting final output
+                _, denoised_pred = self.generator(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                    update_cache=update_cache
+                )
+
+                # Save final result if requested
+                if save_intermediates:
+                    intermediate_results.append({
+                        'timestep': current_timestep.item(),
+                        'denoised_pred': denoised_pred.clone().cpu(),
+                        'step_index': index
+                    })
+
+        if save_intermediates:
+            return denoised_pred, intermediate_results
+        else:
+            return denoised_pred
+
+    def _save_intermediate_videos(self, intermediate_results, output_folder, idx, full_output=None, total_frames=None):
+        """Save intermediate denoising steps as MP4 videos"""
+        import os
+        from torchvision.io import write_video
+        from einops import rearrange
+
+        if not intermediate_results or not output_folder:
+            return
+
+        for result in intermediate_results:
+            # Use full accumulated output if available, otherwise just the current block
+            if full_output is not None and total_frames is not None:
+                # Save the full accumulated video up to current point
+                accumulated_latents = full_output[:, :total_frames]
+                device = next(self.vae.parameters()).device
+                video_data = self.vae.decode_to_pixel(accumulated_latents.to(device), use_cache=False)
+                video_data = (video_data * 0.5 + 0.5).clamp(0, 1)
+                video_data = 255.0 * rearrange(video_data, 'b t c h w -> b t h w c').cpu()
+                filename = f"intermediate_step_{result['step_index']}_timestep_{result['timestep']}_full.mp4"
+            elif 'video' in result:
+                # Use the stored video data
+                video_data = result['video']
+                filename = result['filename']
+            else:
+                # Convert latent to video (just current block)
+                denoised_pred = result['denoised_pred']
+                device = next(self.vae.parameters()).device
+                video_data = self.vae.decode_to_pixel(denoised_pred.to(device), use_cache=False)
+                video_data = (video_data * 0.5 + 0.5).clamp(0, 1)
+                video_data = 255.0 * rearrange(video_data, 'b t c h w -> b t h w c').cpu()
+                filename = f"intermediate_step_{result['step_index']}_timestep_{result['timestep']}.mp4"
+
+            # Save the video file
+            output_path = os.path.join(output_folder, f"{idx}_{filename}")
+            write_video(output_path, video_data[0], fps=16)  # Use first batch item
